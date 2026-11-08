@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Armbian Firmware
-        uses: gpzy1988/amlogic-s9xxx-armbian@main
+        uses: ophub/amlogic-s9xxx-armbian@main
         with:
           build_target: armbian
           armbian_board: tyc4a
