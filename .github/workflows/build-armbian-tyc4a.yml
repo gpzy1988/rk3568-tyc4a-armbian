@@ -1,0 +1,245 @@
+#==========================================================================
+# Description: Build Armbian arm64 server image for TYC4A
+#==========================================================================
+
+name: 编译 Armbian arm64 服务器版镜像 - TYC4A
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      set_release:
+        description: "选择系统版本"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - trixie
+          - bookworm
+          - resolute
+          - noble
+      armbian_board:
+        description: "选择设备板型"
+        required: false
+        default: "tyc4a"
+        type: choice
+        options:
+          - tyc4a
+      armbian_kernel:
+        description: "选择内核版本"
+        required: false
+        default: "6.1.y"
+        type: choice
+        options:
+          - 5.10.y
+          - 5.15.y
+          - 6.1.y
+          - 6.6.y
+          - 6.12.y
+          - 6.18.y
+      kernel_repo:
+        description: "内核仓库"
+        required: false
+        default: "ophub/kernel"
+        type: choice
+        options:
+          - ophub/kernel
+      kernel_usage:
+        description: "选择内核源"
+        required: false
+        default: "flippy"
+        type: choice
+        options:
+          - stable
+          - flippy
+          - beta
+      armbian_fstype:
+        description: "根文件系统类型"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+      armbian_edition:
+        description: "固件版本类型"
+        required: false
+        default: "desktop"
+        type: choice
+        options:
+          - server
+          - desktop
+          - beta
+      builder_name:
+        description: "编译者签名"
+        required: false
+        default: "tyc4a"
+        type: choice
+        options:
+          - ophub
+          - angel
+      config_board:
+        description: "基础镜像板型名称"
+        required: false
+        default: "odroidn2"
+
+env:
+  TZ: Etc/UTC
+  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: 根据选择的系统版本生成编译矩阵
+        id: set-matrix
+        run: |
+          if [[ "${{ inputs.set_release }}" == "all" ]]; then
+            MATRIX='{"include":[{"release":"trixie"},{"release":"bookworm"},{"release":"resolute"},{"release":"noble"}]}'
+          else
+            MATRIX='{"include":[{"release":"${{ inputs.set_release }}"}]}'
+          fi
+          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: setup
+    runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    name: 编译Armbian-${{ matrix.release }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v6
+
+      - name: 初始化编译环境
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo apt-get -y update
+          sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
+          sudo systemctl daemon-reload
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 创建虚拟磁盘扩容存储空间
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 下载 Armbian 源码
+        id: down
+        working-directory: /builder
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          df -hT ${PWD}
+          git clone -q --single-branch --depth=1 --branch=main https://github.com/armbian/build.git build
+          ln -sf /builder/build ${{ github.workspace }}/build
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 编译 Armbian 基础镜像 [ ${{ matrix.release }} ]
+        id: compile
+        working-directory: /builder
+        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes 2>/dev/null || true
+
+          config_board="${{ inputs.config_board }}"
+          [[ -z "${config_board}" ]] && config_board="odroidn2"
+
+          cd build/
+              ./compile.sh RELEASE=${{ matrix.release }} BOARD=${config_board} BRANCH=current BUILD_MINIMAL=no \
+                           BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
+                           COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 整理输出文件并释放磁盘空间
+        id: clean
+        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd build/
+          rm -rf $(ls . | grep -v "^output$" | xargs) 2>/dev/null
+
+          df -hT ${PWD}
+          echo "build_tag=Armbian_${{ matrix.release }}_arm64_${{ inputs.armbian_edition }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 上传 Armbian 基础镜像到 Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: build/output/images/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 为目标板型重打包 Armbian 固件
+        uses: gpzy1988/amlogic-s9xxx-armbian@main
+        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        with:
+          build_target: armbian
+          armbian_path: build/output/images/*.img.gz
+          armbian_board: ${{ inputs.armbian_board }}
+          armbian_kernel: ${{ inputs.armbian_kernel }}
+          auto_kernel: true
+          kernel_repo: ${{ inputs.kernel_repo }}
+          kernel_usage: ${{ inputs.kernel_usage }}
+          armbian_fstype: ${{ inputs.armbian_fstype }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: 上传重打包后的固件到 Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### Armbian 固件信息
+            - 默认用户名：`root`
+            - 默认密码：`1234`
